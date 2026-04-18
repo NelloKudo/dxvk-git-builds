@@ -1,0 +1,77 @@
+name: Repackage DXVK
+
+on:
+  push:
+    paths: ['dxvk-version']
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit SHA (leave empty to use dxvk-version file)'
+        required: false
+
+jobs:
+  repackage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve commit SHA
+        run: |
+          COMMIT="${{ inputs.commit }}"
+          [ -z "$COMMIT" ] && COMMIT=$(cat dxvk-version | tr -d '[:space:]')
+          echo "SHA=$COMMIT" >> $GITHUB_ENV
+          echo "SHORT_SHA=${COMMIT:0:7}" >> $GITHUB_ENV
+
+      - name: Read version from meson.build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(gh api "repos/doitsujin/dxvk/contents/meson.build?ref=$SHA" \
+            --jq '.content' | base64 -d | \
+            grep -m1 -oP "version\s*:\s*'\K[\d.]+")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "PKG_NAME=dxvk-git-${VERSION}-${SHORT_SHA}" >> $GITHUB_ENV
+
+      - name: Find successful workflow run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_ID=$(gh api "repos/doitsujin/dxvk/actions/runs?head_sha=$SHA&status=success" \
+            --jq '.workflow_runs | first | .id')
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful workflow run found for $SHA" && exit 1
+          fi
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+      - name: Download artifact
+        env:
+          GH_TOKEN: ${{ secrets.DXVK_TOKEN }}
+        run: |
+          DOWNLOAD_URL=$(gh api "repos/doitsujin/dxvk/actions/runs/$RUN_ID/artifacts" \
+            --jq '.artifacts[0].archive_download_url')
+          curl -L -H "Authorization: Bearer ${{ secrets.DXVK_TOKEN }}" "$DOWNLOAD_URL" -o artifact.zip
+
+      - name: Repackage
+        run: |
+          mkdir artifact-raw
+          unzip artifact.zip -d artifact-raw/
+          rm -f artifact-raw/dxvk-native-*.tar.gz
+
+          mkdir "$PKG_NAME"
+          mv artifact-raw/x32 artifact-raw/x64 "$PKG_NAME/"
+
+          tar -cJf "${PKG_NAME}.tar.xz" "$PKG_NAME/"
+          sha256sum "${PKG_NAME}.tar.xz" > "${PKG_NAME}.tar.xz.sha256"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$PKG_NAME" \
+            "${PKG_NAME}.tar.xz" \
+            "${PKG_NAME}.tar.xz.sha256" \
+            --title "DXVK $VERSION ($SHORT_SHA)" \
+            --notes "commit: $SHA"
